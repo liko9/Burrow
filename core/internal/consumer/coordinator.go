@@ -20,6 +20,8 @@
 // * kafka - Consume a Kafka cluster's __consumer_offsets topic to get consumer information (new consumer)
 //
 // * kafka_zk - Parse the /consumers tree of a Kafka cluster's metadata to get consumer information (old consumer)
+//
+// * kafka_admin - Use the Kafka AdminClient API to get the consumer group names and offsets (doesn't require zookeeper access)
 package consumer
 
 import (
@@ -66,6 +68,11 @@ func getModuleForClass(app *protocol.ApplicationContext, moduleName string, clas
 		}
 	case "kafka_zk":
 		return &KafkaZkClient{
+			App: app,
+			Log: logger,
+		}
+	case "kafka_admin":
+		return &KafkaAdminClient{
 			App: app,
 			Log: logger,
 		}
