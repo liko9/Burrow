@@ -49,6 +49,8 @@ type KafkaAdminClient struct {
 	saramaConfig          *sarama.Config
 	groupWhitelist        *regexp.Regexp
 	groupBlacklist        *regexp.Regexp
+        offsetRefresh         int
+        offsetTicker          *time.Ticker
 
 	quitChannel chan struct{}
 	running     sync.WaitGroup
@@ -110,6 +112,9 @@ func (module *KafkaAdminClient) Configure(name string, configRoot string) {
 	} else if !helpers.ValidateHostList(module.servers) {
 		panic("Consumer '" + name + "' has one or more improperly formatted servers (must be host:port)")
 	}
+        // Set defaults for configs if needed
+        viper.SetDefault(configRoot+".offset-refresh", 30)
+        module.offsetRefresh = viper.GetInt(configRoot + ".offset-refresh")
 
 	// Set defaults for configs if needed, and get them
 	// Following are no longer needed with AdminClient
@@ -140,100 +145,56 @@ func (module *KafkaAdminClient) Configure(name string, configRoot string) {
 	}
 }
 
-// Start connects to the Kafka cluster using the Shopify/sarama client. Any error connecting to the cluster is returned
-// to the caller. Once the client is set up, the consumers for the configured offsets topic are started.
-func (module *KafkaAdminClient) Start() error {
-	module.Log.Info("starting")
-
-	// Connect Kafka client
-	adminclient, err := sarama.NewClusterAdmin(module.servers, module.saramaConfig)
-	if err != nil {
-		module.Log.Error("failed to start adminclient", zap.Error(err))
-		return err
+func (module *KafkaAdminClient) acceptConsumerGroup(group string) bool {
+	if (module.groupWhitelist != nil) && (!module.groupWhitelist.MatchString(group)) {
+		return false
 	}
-
-	// Start a non-admin client to get topic partition offsets
-	client, err := sarama.NewClient(module.servers, module.saramaConfig)
-	if err != nil {
-		module.Log.Error("failed to start client", zap.Error(err))
-		return err
+	if (module.groupBlacklist != nil) && module.groupBlacklist.MatchString(group) {
+		return false
 	}
+	return true
+}
+
+
+func (module *KafkaAdminClient) mainLoop(adminclient sarama.ClusterAdmin) {
+        module.running.Add(1)
+        defer module.running.Done()
 
 	// Get all consumer groups
 	allGroups, err := adminclient.ListConsumerGroups()
         if err != nil {
 		module.Log.Error("failed to list consumer groups", zap.Error(err))
-		return err
+		return
 	}
 	for group := range allGroups {
 		groupDescriptions, err := adminclient.DescribeConsumerGroups([]string{group})
                 if err != nil {
 			module.Log.Error("failed to describe consumer groups", zap.Error(err))
-			return err
+			return
                 }
                 for _, groupDescription := range groupDescriptions {
                         for _, member := range groupDescription.Members {
                                 assignment, err := member.GetMemberAssignment()
                                 if err != nil {
 					module.Log.Error("failed to get member assignments", zap.Error(err))
-					return err
+					return
                                 }
                                 offsetFetchResponse, err := adminclient.ListConsumerGroupOffsets(group, assignment.Topics)
                                 if err != nil {
 					module.Log.Error("failed to list consumer group offsets", zap.Error(err))
-					return err
+					return
                                 }
                                 for topic := range offsetFetchResponse.Blocks {
                                         for partition, ofrb := range offsetFetchResponse.Blocks[topic] {
-                                                logEndOffset, err := client.GetOffset(topic, partition, sarama.OffsetNewest)
-                                                if err != nil {
-							module.Log.Error("failed to topic partition offsets", zap.Error(err))
-							return err
-                                                }
-						burrowOffset := &protocol.StorageRequest{
-							RequestType: protocol.StorageSetConsumerOffset,
-							Cluster:     module.cluster,
-							Topic:       topic,
-							Partition:   partition,
-							Group:       module.reportedConsumerGroup,
-							Timestamp:   time.Now().Unix() * 1000,
-							Offset:      logEndOffset + 1, // emulating a consumer which should commit (lastSeenOffset+1)
-						}
-						helpers.TimeoutSendStorageRequest(module.App.StorageChannel, burrowOffset, 1)
-//							offsetLogger := logger.With(
-//								zap.String("message_type", "offset"),
-//								zap.String("group", group),
-//								zap.String("topic", topic),
-//								zap.Int32("partition", partition),
-//							)
-//						if !module.acceptConsumerGroup(group) {
-//							offsetLogger.Debug("dropped", zap.String("reason", "whitelist"))
-//							return
-//						}
-						partitionOffset := &protocol.StorageRequest{
-							RequestType: protocol.StorageSetConsumerOffset,
-							Cluster:     module.cluster,
-							Topic:       topic,
-							Partition:   partition,
-							Group:       group,
-							Timestamp:   time.Now().Unix() * 1000,
-							Offset:      ofrb.Offset,
-							Order:       ofrb.Offset,
-						}
-//						logger.Debug("consumer offset",
-//							zap.Int64("offset", LogEndOffset),
-//							zap.Int64("timestamp", time.Now().Unix() * 1000),
-//						)
-						helpers.TimeoutSendStorageRequest(module.App.StorageChannel, partitionOffset, 1)
-						// If memberCount is zero, clear all ownership
-						if len(groupDescription.Members) == 0 {
-//							metadataLogger.Debug("clear owners")
-							helpers.TimeoutSendStorageRequest(module.App.StorageChannel, &protocol.StorageRequest{
-								RequestType: protocol.StorageClearConsumerOwners,
-								Cluster:     module.cluster,
-								Group:       group,
-								}, 1)
-//							return
+						offsetLogger := module.Log.With(
+							zap.String("message_type", "offset"),
+							zap.String("group", group),
+							zap.String("topic", topic),
+							zap.Int32("partition", partition),
+						)
+						if !module.acceptConsumerGroup(group) {
+							offsetLogger.Debug("dropped", zap.String("reason", "whitelist"))
+							return
 						}
 						helpers.TimeoutSendStorageRequest(module.App.StorageChannel, &protocol.StorageRequest{
 							RequestType: protocol.StorageSetConsumerOwner,
@@ -244,12 +205,80 @@ func (module *KafkaAdminClient) Start() error {
 							Owner:       member.ClientHost,
 							ClientID:    member.ClientId,
 						}, 1)
+						burrowOffset := &protocol.StorageRequest{
+							RequestType: protocol.StorageSetConsumerOffset,
+							Cluster:     module.cluster,
+							Topic:       topic,
+							Partition:   partition,
+							Group:       module.reportedConsumerGroup,
+							Timestamp:   time.Now().Unix() * 1000,
+							Offset:      ofrb.Offset + 1, // emulating a consumer which should commit (lastSeenOffset+1)
+						}
+						helpers.TimeoutSendStorageRequest(module.App.StorageChannel, burrowOffset, 1)
+//						logger.Debug("consumer offset",
+//							zap.Int64("offset", logEndOffset),
+//							zap.Int64("timestamp", time.Now().Unix() * 1000),
+//						)
+//						helpers.TimeoutSendStorageRequest(module.App.StorageChannel, partitionOffset, 1)
+//						metadata, err := member.GetMemberMetadata()
+//						if err != nil {
+//							module.Log.Error("failed to get member metadata", zap.Error(err))
+//							return
+//						}
+//						metadataLogger := logger.With(
+//							zap.String("protocol_type", &metadata.ProtocolType),
+//							//zap.Int32("generation", &metadata.Generation),
+//							zap.String("protocol", &metadata.Protocol),
+//							//zap.String("leader", &metadata.Leader),
+//							//zap.Int64("current_state_timestamp", &metadata.CurrentStateTimestamp),
+//						)
+//						metadataLogger.Debug("group metadata")
+//						if &metadata.ProtocolType != "consumer" {
+//							metadataLogger.Debug("skipped metadata because of unknown protocolType")
+//						return
+//						}
+//
+//						// If memberCount is zero, clear all ownership
+//						if len(&metadata.Members) == 0 {
+//							metadataLogger.Debug("clear owners")
+//							helpers.TimeoutSendStorageRequest(module.App.StorageChannel, &protocol.StorageRequest{
+//								RequestType: protocol.StorageClearConsumerOwners,
+//								Cluster:     module.cluster,
+//								Group:       group,
+//								}, 1)
+//							return
+//						}
 					}
 				}
 			}
 		}
 	}
+}
 
+// Start connects to the Kafka cluster using the Shopify/sarama client. Any error connecting to the cluster is returned
+// to the caller. Once the client is set up, the consumers for the configured offsets topic are started.
+func (module *KafkaAdminClient) Start() error {
+	module.Log.Info("starting")
+        for {
+                select {
+                case <-module.offsetTicker.C:
+                        module.getOffsets(client)
+                case <-module.quitChannel:
+                        return
+                }
+        }
+
+func (module *KafkaCluster) getOffsets(client helpers.SaramaClient) {
+	// Connect Kafka adminclient
+	adminclient, err := sarama.NewClusterAdmin(module.servers, module.saramaConfig)
+	if err != nil {
+		module.Log.Error("failed to start adminclient", zap.Error(err))
+		return err
+	}
+
+
+        module.offsetTicker = time.NewTicker(time.Duration(module.offsetRefresh) * time.Second)
+        go module.mainLoop(adminclient)
 	return nil
 }
 
@@ -463,16 +492,6 @@ func (module *KafkaAdminClient) Stop() error {
 //	}
 //	return string(strbytes), nil
 //}
-
-func (module *KafkaAdminClient) acceptConsumerGroup(group string) bool {
-	if (module.groupWhitelist != nil) && (!module.groupWhitelist.MatchString(group)) {
-		return false
-	}
-	if (module.groupBlacklist != nil) && module.groupBlacklist.MatchString(group) {
-		return false
-	}
-	return true
-}
 
 //func (module *KafkaAdminClient) decodeKeyAndOffset(offsetOrder int64, keyBuffer *bytes.Buffer, value []byte, logger *zap.Logger) {
 //	// Version 0 and 1 keys are decoded the same way
